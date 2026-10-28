@@ -1,0 +1,4 @@
+{"id": "minggu151624/zac-sft", "title": "zac-sft", "code_file": "kernel.py", "language": "python",
+ "kernel_type": "script", "is_private": true, "enable_gpu": true, "enable_internet": true,
+ "dataset_sources": ["minggu151624/zac2026-lifemate-data", "minggu151624/zac2026-lifemate-code"],
+ "competition_sources": [], "kernel_sources": []}

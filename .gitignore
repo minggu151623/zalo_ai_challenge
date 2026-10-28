@@ -1,0 +1,12 @@
+# Allowlist: only code goes in the repo. The competition dataset (train/, public_test/, audio, environments,
+# zaic_tools, README/VERSION), anything derived from it (out/, submission.jsonl) and the saved competition pages stay local.
+/*
+!/.gitignore
+!/README.md
+!/kaggle/
+!/train+public_test/
+/train+public_test/*
+!/train+public_test/solution/
+__pycache__/
+*.pyc
+.DS_Store
