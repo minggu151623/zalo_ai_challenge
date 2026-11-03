@@ -1,5 +1,5 @@
 {
- "id": "huangvu1/zac-sftf3",
+ "id": "minggu151624/zac-sftf3",
  "title": "zac-sftf3",
  "code_file": "kernel.py",
  "language": "python",
@@ -8,11 +8,11 @@
  "enable_gpu": true,
  "enable_internet": true,
  "dataset_sources": [
-  "huangvu1/zac2026-lifemate-data",
-  "huangvu1/zac2026-lifemate-code"
+  "minggu151624/zac2026-lifemate-data",
+  "minggu151624/zac2026-lifemate-code"
  ],
  "competition_sources": [],
  "kernel_sources": [
-  "huangvu1/zac-sftf2"
+  "minggu151624/zac-sftf2"
  ]
 }

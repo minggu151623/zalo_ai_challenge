@@ -1,5 +1,5 @@
 # Kaggle job (2xT4): sftf3 = epoch 3 of sftf (all train, --compact). Starts from sftf2's adapter (kernel output
-# huangvu1/zac-sftf2), same data in a new order at lr 3e-5, as sftc3 did (the best epoch of the sftc chain). Public_test only.
+# minggu151624/zac-sftf2), same data in a new order at lr 3e-5, as sftc3 did (the best epoch of the sftc chain). Public_test only.
 import glob
 import os
 import shutil
