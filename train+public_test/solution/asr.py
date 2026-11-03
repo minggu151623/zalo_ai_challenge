@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--final-only", action="store_true", help="only the final turn (faster WER check)")
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--beams", type=int, default=1, help="beam size (still deterministic)")
     ap.add_argument("--fold", type=int, help="transcribe only this train fold (outside the holdout), see --folds")
     ap.add_argument("--folds", type=int, default=2)
     ap.add_argument("--out", required=True)
@@ -94,7 +95,7 @@ def main():
         asr = pipeline("automatic-speech-recognition", model=a.model, dtype=torch.float16, device=0)
     except TypeError:  # transformers < 4.56
         asr = pipeline("automatic-speech-recognition", model=a.model, torch_dtype=torch.float16, device=0)
-    gen_kwargs = {"language": "vi", "task": "transcribe", "num_beams": 1, "do_sample": False}
+    gen_kwargs = {"language": "vi", "task": "transcribe", "num_beams": a.beams, "do_sample": False}
     t0 = time.time()
     audio = [{"raw": read_wav(p), "sampling_rate": 16000} for _, _, p, _ in jobs]
     secs = sum(len(x["raw"]) for x in audio) / 16000  # before the pipeline: it pops "raw" from each dict
@@ -118,7 +119,7 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"{len(jobs)} clips, {secs / 60:.1f} min audio in {dt:.0f}s (RTF {dt / secs:.3f})")
     if toks:
-        print(f"WER {100 * errs / toks:.2f}%  ({a.model})")
+        print(f"WER {100 * errs / toks:.2f}%  ({a.model}, beams {a.beams})")
 
 
 if __name__ == "__main__":

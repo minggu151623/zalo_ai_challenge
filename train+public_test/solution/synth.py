@@ -4,7 +4,8 @@ states and requests are invented here, nothing is read from public_test samples 
     python solution/synth.py --n 600 --out out/synth.jsonl
 Each sample borrows the context and seen-app state of a random train sample (contacts, sms, reminders...), adds one
 unseen app with a generated state, and gets gold calls written by a per-app task template. The calls are executed with
-zaic_tools' Simulator, so tool_results are real. Output lines look like train.jsonl ({id, audio_text, context, history,
+zaic_tools' Simulator, so tool_results are real. Most samples keep the base sample's history (the base state is the one
+after it), and follow-up tasks add an earlier turn on the unseen app. Output lines look like train.jsonl ({id, audio_text, context, history,
 label: {tool_calls, tool_results}}) plus "states" (initial state of every installed app) so sft_data.py can use them.
 """
 from __future__ import annotations
@@ -76,8 +77,10 @@ def hour_words(c, h, m=0):
 
 
 # ---------------------------------------------------------------------------------------------- app generators
-# Each returns (state, [task, ...]); a task is (utterance, [planned calls]) where a planned call is (name, args) or a
-# callable(results_so_far) -> (name, args) | None for steps that depend on earlier results (conditions).
+# Each returns (state, [task, ...]); a task is (utterance, [planned calls]) with a planned call (name, args), or
+# (utterance, [planned calls], prior) for a follow-up: prior = (utterance, [calls], reply) is an earlier turn that goes
+# into the history (its results stay visible, so the final turn reuses IDs from them instead of reading again).
+CANCEL = ["à thôi khỏi, để sau", "thôi không cần nữa", "ừm thôi, để mình tính lại đã", "khoan, thôi bỏ đi"]
 
 def gen_stocks(c):
     pool = [("FPT", "FPT", 128000), ("VNM", "Vinamilk", 61500), ("VCB", "Vietcombank", 89200), ("HPG", "Hòa Phát", 26750),
@@ -111,6 +114,14 @@ def gen_stocks(c):
         (c.say(f"nếu {qs} đang dưới {c.money((qp // 1000 - 5) * 1000)} thì mua {k} cổ, không thì thôi"),
          [("stocks.get_quote", {"symbol": qs})]),
         (c.say(f"mua thêm cổ phiếu {qs} cho tôi"), [("sys.ask_missing_info", {"tool_name": "stocks.place_order", "params": ["quantity"]})]),
+        (c.say(f"vậy mua {k} cổ đi"), [("stocks.place_order", {"symbol": qs, "side": "buy", "quantity": k})],
+         (c.say(f"giá {qs} bây giờ bao nhiêu"), [("stocks.get_quote", {"symbol": qs})], f"{qs} đang ở mức {qp} đồng.")),
+        (c.say(f"{c.n(k // 100)} trăm cổ"), [("stocks.place_order", {"symbol": qs, "side": "buy", "quantity": k})],
+         (c.say(f"mua thêm cổ phiếu {qs} cho tôi"), [("sys.ask_missing_info", {"tool_name": "stocks.place_order", "params": ["quantity"]})],
+          f"Anh muốn mua bao nhiêu cổ {qs} ạ?")),
+        (c.say(c.pick(CANCEL)), [],
+         (c.say(f"mua thêm cổ phiếu {qs} cho tôi"), [("sys.ask_missing_info", {"tool_name": "stocks.place_order", "params": ["quantity"]})],
+          f"Anh muốn mua bao nhiêu cổ {qs} ạ?")),
     ]
     return st, tasks
 
@@ -127,6 +138,9 @@ def gen_translator(c):
         (c.say(f"{p} {c.pick(['nói', 'tiếng'])} {lname.replace('tiếng ', '')} là gì"), [("translator.translate", {"text": p, "to_lang": code})]),
         (c.say(f"câu \"{p}\" {lname} nói thế nào"), [("translator.translate", {"text": p, "to_lang": code})]),
         (c.say(f"dịch giúp tôi câu \"{p}\""), [("sys.ask_missing_info", {"tool_name": "translator.translate", "params": ["to_lang"]})]),
+        (c.say(f"sang {lname}"), [("translator.translate", {"text": p, "to_lang": code})],
+         (c.say(f"dịch giúp tôi câu \"{p}\""), [("sys.ask_missing_info", {"tool_name": "translator.translate", "params": ["to_lang"]})],
+          "Bạn muốn dịch sang tiếng nào?")),
     ]
     return st, tasks
 
@@ -162,6 +176,12 @@ def gen_grocery(c):
          [("grocery.search", {"query": ka}), ("grocery.add_to_cart", {"product_id": a["id"], "quantity": qa}),
           ("grocery.checkout", {"delivery_time": c.at(0, h)})]),
         (c.say(f"mua {ka} trên app đi chợ"), [("sys.ask_missing_info", {"tool_name": "grocery.add_to_cart", "params": ["quantity"]})]),
+        (c.say(f"lấy {c.n(qa)} {a['unit']} {ka} đó rồi đặt luôn"),
+         [("grocery.add_to_cart", {"product_id": a["id"], "quantity": qa}), ("grocery.checkout", {})],
+         (c.say(f"tìm {ka} trên app đi chợ"), [("grocery.search", {"query": ka})], f"Có {a['name']} giá {a['price']} đồng.")),
+        (c.say(f"{c.n(qa)} {a['unit']}"), [("grocery.search", {"query": ka}), ("grocery.add_to_cart", {"product_id": a["id"], "quantity": qa})],
+         (c.say(f"mua {ka} trên app đi chợ"), [("sys.ask_missing_info", {"tool_name": "grocery.add_to_cart", "params": ["quantity"]})],
+          f"Bạn muốn mua bao nhiêu {ka}?")),
     ]
     return st, tasks
 
@@ -188,6 +208,10 @@ def gen_ecommerce(c):
     sh_kw = sh["items"][0]["name"].split()[0].lower() + " " + sh["items"][0]["name"].split()[1].lower()
     dl_kw = dl["items"][0]["name"].split()[0].lower() + " " + dl["items"][0]["name"].split()[1].lower()
     pay, pword = c.pick([("ewallet", "ví điện tử"), ("bank", "chuyển khoản ngân hàng"), ("cod", "tiền mặt khi nhận hàng")])
+    p_kw = " ".join(p["name"].split()[:2]).lower() + " " + p["name"].split()[-1]
+    q = c.r.randint(1, 3)
+    addr = c.pick(["12 Nguyễn Trãi, Thanh Xuân, Hà Nội", "45 Lê Lợi, Quận 1, TP.HCM", "88 Bạch Đằng, Hải Châu, Đà Nẵng",
+                   "công ty, 21 Duy Tân, Cầu Giấy, Hà Nội"])
     tasks = [
         (c.say(f"tìm {kw} dưới {c.money(cap)} trên sàn"), [("ecommerce.search", {"query": kw, "max_price": cap})]),
         (c.say(f"đơn hàng của tôi giao tới đâu rồi"), [("ecommerce.order_status", {})]),
@@ -199,6 +223,22 @@ def gen_ecommerce(c):
           ("ecommerce.checkout", {"payment": pay})]),
         (c.say(f"trả lại cái {dl_kw} mới nhận"), [("ecommerce.order_status", {}),
                                                 ("sys.ask_missing_info", {"tool_name": "ecommerce.request_return", "params": ["reason"]})]),
+        (c.say(f"cho {c.n(q)} cái {p_kw} vào giỏ hàng"),
+         [("ecommerce.search", {"query": p_kw}), ("ecommerce.add_to_cart", {"product_id": p["id"], "quantity": q})]),
+        (c.say(f"mua cái {p_kw} giao tới {addr}, trả {pword}"),
+         [("ecommerce.search", {"query": p_kw}), ("ecommerce.add_to_cart", {"product_id": p["id"], "quantity": 1}),
+          ("ecommerce.checkout", {"address": addr, "payment": pay})]),
+        (c.say(f"thanh toán giỏ hàng {c.pick(['luôn', 'giúp tôi', 'đi'])}, trả {pword}"), [("ecommerce.checkout", {"payment": pay})],
+         (c.say(f"cho {c.n(q)} cái {p_kw} vào giỏ hàng"),
+          [("ecommerce.search", {"query": p_kw}), ("ecommerce.add_to_cart", {"product_id": p["id"], "quantity": q})],
+          f"Đã thêm {q} {p['name']} vào giỏ.")),
+        (c.say(f"huỷ cái đơn {sh_kw} đang giao đi"), [("ecommerce.cancel_order", {"order_id": sh["id"]})],
+         (c.say("xem các đơn hàng của tôi"), [("ecommerce.order_status", {})],
+          f"Bạn có 2 đơn: {sh['items'][0]['name']} đang giao và {dl['items'][0]['name']} đã giao.")),
+        (c.say(f"nó {rword}"), [("ecommerce.request_return", {"order_id": dl["id"], "reason": reason})],
+         (c.say(f"trả lại cái {dl_kw} mới nhận"), [("ecommerce.order_status", {}),
+                                                 ("sys.ask_missing_info", {"tool_name": "ecommerce.request_return", "params": ["reason"]})],
+          "Bạn muốn trả hàng vì lý do gì?")),
     ]
     return st, tasks
 
@@ -229,6 +269,11 @@ def gen_event_tickets(c):
         tasks.append((c.say(f"đặt {c.n(q)} vé {key}"), [("event_tickets.search", {"query": key}),
                                                        ("sys.ask_missing_info", {"tool_name": "event_tickets.book", "params": ["event_id"]})]))
     tasks.append((c.say(f"mua vé {e['name'].split(' - ')[0]}"), [("sys.ask_missing_info", {"tool_name": "event_tickets.book", "params": ["quantity"]})]))
+    cat = [x for x in evs if x["category"] == e["category"]]
+    tasks.append((c.say(f"đặt {c.n(q)} vé {e['name'].split(' - ')[0]} {'đi' if len(cat) > 1 else 'đó đi'}"),
+                  [("event_tickets.book", {"event_id": e["id"], "quantity": q})],
+                  (c.say(f"có sự kiện {e['category']} nào không"), [("event_tickets.search", {"query": e["category"]})],
+                   f"Có {e['name']} ngày {e['date']} tại {e['venue']}.")))
     return st, tasks
 
 
@@ -249,6 +294,8 @@ def gen_habit_tracker(c):
         (c.say(f"hôm nay xong {word} với {pool[1][1]} rồi"),
          [("habit_tracker.list_habits", {}), ("habit_tracker.log", {"habit_id": h["id"], "date": today}),
           ("habit_tracker.log", {"habit_id": habits[1]["id"], "date": today})]),
+        (c.say(f"ừ, đánh dấu hôm nay {word} rồi"), [("habit_tracker.log", {"habit_id": h["id"], "date": today})],
+         (c.say(f"chuỗi {word} của tôi được mấy ngày rồi"), [("habit_tracker.list_habits", {})], f"Chuỗi {h['name']} đang là {h['streak']} ngày.")),
     ]
     return st, tasks
 
@@ -269,6 +316,12 @@ def gen_pantry(c):
          [("pantry.list_items", {}), ("pantry.consume", {"item_id": a["id"], "quantity": qa}), ("pantry.consume", {"item_id": b["id"], "quantity": qb})]),
         (c.say(f"đánh dấu là tôi đã dùng {a['name'].lower()}"), [("pantry.list_items", {}),
                                                                ("sys.ask_missing_info", {"tool_name": "pantry.consume", "params": ["quantity"]})]),
+        (c.say(f"{c.n(qa)} {a['unit']}"), [("pantry.consume", {"item_id": a["id"], "quantity": qa})],
+         (c.say(f"đánh dấu là tôi đã dùng {a['name'].lower()}"), [("pantry.list_items", {}),
+                                                                ("sys.ask_missing_info", {"tool_name": "pantry.consume", "params": ["quantity"]})],
+          f"Bạn đã dùng bao nhiêu {a['unit']} {a['name'].lower()}?")),
+        (c.say(f"trừ đi {c.n(qa)} {a['unit']} nhé, vừa nấu xong"), [("pantry.consume", {"item_id": a["id"], "quantity": qa})],
+         (c.say(f"trong bếp còn bao nhiêu {a['name'].lower()}"), [("pantry.list_items", {})], f"Còn {a['stock']} {a['unit']} {a['name'].lower()}.")),
     ]
     return st, tasks
 
@@ -296,6 +349,10 @@ def gen_parking(c):
         (c.say("tôi lấy xe rồi, kết thúc phiên đỗ đi"), [("parking.list_sessions", {}), ("parking.end_session", {"session_id": "park_01"})]),
         (c.say("xem tôi đang có chỗ đỗ nào đã đặt"), [("parking.list_sessions", {})]),
         (c.say(f"đặt chỗ đỗ gần {lot['area']} {dword}"), [("sys.ask_missing_info", {"tool_name": "parking.reserve", "params": ["from_time", "hours"]})]),
+        (c.say(f"đặt chỗ ở {lot['name']} lúc {hour_words(c, h)} {dword}, {c.n(hrs)} tiếng"),
+         [("parking.reserve", {"lot_id": lot["id"], "from_time": c.at(off, h), "hours": hrs})],
+         (c.say(f"tìm bãi đỗ xe gần {lot['area']}"), [("parking.find", {"near": lot["area"]})],
+          f"Có {lot['name']} ở {lot['address']}, còn {lot['available_spots']} chỗ.")),
     ]
     return st, tasks
 
@@ -324,6 +381,12 @@ def gen_public_transit(c):
         (c.say(f"xe {num} ở trạm {r['stops'][1]} mấy giờ có chuyến"), [("public_transit.next_departures", {"stop": r["stops"][1], "route": num})]),
         (c.say(f"nạp {c.money(amt)} vào thẻ xe buýt"), [("public_transit.topup_card", {"amount": amt})]),
         (c.say("nạp tiền vào thẻ đi xe giúp tôi"), [("sys.ask_missing_info", {"tool_name": "public_transit.topup_card", "params": ["amount"]})]),
+        (c.say(c.money(amt)), [("public_transit.topup_card", {"amount": amt})],
+         (c.say("nạp tiền vào thẻ đi xe giúp tôi"), [("sys.ask_missing_info", {"tool_name": "public_transit.topup_card", "params": ["amount"]})],
+          "Bạn muốn nạp bao nhiêu tiền?")),
+        (c.say(c.pick(CANCEL)), [],
+         (c.say("nạp tiền vào thẻ đi xe giúp tôi"), [("sys.ask_missing_info", {"tool_name": "public_transit.topup_card", "params": ["amount"]})],
+          "Bạn muốn nạp bao nhiêu tiền?")),
     ]
     return st, tasks
 
@@ -348,6 +411,8 @@ def gen_recipes(c):
         (c.say(f"nấu {name} cho {c.n(ppl)} người thì cần những gì"), [("recipes.search", {"query": name, "servings": ppl})]),
         (c.say(f"lưu công thức {name} lại"), [("recipes.search", {"query": name}), ("recipes.save", {"recipe_id": r["id"]})]),
         (c.say(f"chỉ tôi các bước làm {name}"), [("recipes.search", {"query": name}), ("recipes.get", {"recipe_id": r["id"]})]),
+        (c.say("lưu công thức đó lại"), [("recipes.save", {"recipe_id": r["id"]})],
+         (c.say(f"tìm cách nấu {name}"), [("recipes.search", {"query": name})], f"Có công thức {r['name']} cho {r['servings']} người.")),
     ]
     return st, tasks
 
@@ -378,10 +443,25 @@ def gen_train_bus_tickets(c):
         (c.say("huỷ vé xe tôi đã đặt"), [("train_bus_tickets.my_bookings", {}), ("train_bus_tickets.cancel", {"booking_id": "tk_01"})]),
         (c.say(f"tìm vé {kind} đi {d}"), [("sys.ask_missing_info", {"tool_name": "train_bus_tickets.search", "params": ["date"]})]),
     ]
+    by_time = [x for x in trips if x["date"] == date and x["type"] == t["type"] and x["depart"] == t["depart"]]
+    if len(by_time) == 1:  # the hour picks one trip even when several run that day
+        tasks.append((c.say(f"đặt {c.n(s)} vé {kind} {hour_words(c, int(t['depart'][:2]))} {dword} từ {o} đi {d}"),
+                      [("train_bus_tickets.search", {"origin": o, "destination": d, "date": date, "type": t["type"]}),
+                       ("train_bus_tickets.book", {"trip_id": t["id"], "seats": s})]))
+        tasks.append((c.say(f"đặt vé {kind} {hour_words(c, int(t['depart'][:2]))} {dword} từ {o} đi {d}"),
+                      [("train_bus_tickets.search", {"origin": o, "destination": d, "date": date, "type": t["type"]}),
+                       ("sys.ask_missing_info", {"tool_name": "train_bus_tickets.book", "params": ["seats"]})]))
     if len(hits) == 1:
         tasks.append((c.say(f"đặt {c.n(s)} vé {kind} từ {o} đi {d} {dword}"),
                       [("train_bus_tickets.search", {"origin": o, "destination": d, "date": date, "type": t["type"]}),
                        ("train_bus_tickets.book", {"trip_id": t["id"], "seats": s})]))
+    same = [x for x in trips if x["date"] == date and x["depart"] == t["depart"]]
+    if len(same) == 1:
+        tasks.append((c.say(f"đặt {c.n(s)} vé chuyến {int(t['depart'][:2])} giờ đó"), [("train_bus_tickets.book", {"trip_id": t["id"], "seats": s})],
+                      (c.say(f"tìm vé đi từ {o} ra {d} {dword}"), [("train_bus_tickets.search", {"origin": o, "destination": d, "date": date})],
+                       f"Có {len([x for x in trips if x['date'] == date])} chuyến, sớm nhất lúc {min(x['depart'] for x in trips if x['date'] == date)}.")))
+    tasks.append((c.say("huỷ vé đó đi"), [("train_bus_tickets.cancel", {"booking_id": "tk_01"})],
+                  (c.say("xem các vé tàu xe tôi đã đặt"), [("train_bus_tickets.my_bookings", {})], f"Bạn có 1 vé {old['origin']} đi {old['destination']} ngày {old['date']}.")))
     return st, tasks
 
 
@@ -407,16 +487,30 @@ def combo(c, item, states, utter, calls):
     return utter, calls
 
 
-def build(i, rng, base_items, envs, catalog, app):
+def build(i, rng, base_items, envs, catalog, app, p_hist=0.6):
     base = rng.choice(base_items)
     item = {"id": f"synth_{i:04d}", "audio": None, "history": [], "context": copy.deepcopy(base["context"])}
+    if rng.random() < p_hist:  # most real samples come mid-conversation; the base's state is already after its history
+        item["history"] = copy.deepcopy(base.get("history") or [])
     states = {a: copy.deepcopy(s) for a, s in envs[base["id"]].items() if a != "_meta"}
     now = datetime.fromisoformat(item["context"]["current_time"])
     c = Ctx(rng, now)
     st, tasks = GENS[app](c)
-    utter, plan = rng.choice(tasks)
+    utter, plan, *prior = rng.choice(tasks)
+    prior = prior[0] if prior else None
+    if app == "grocery" and rng.random() < 0.5:
+        # both installed: "danh sách đi chợ" is the shopping list, not an order on the grocery app (half keep the order task)
+        if "shopping_list" not in item["context"]["installed_apps"]:
+            item["context"]["installed_apps"]["shopping_list"] = {"tools": ["shopping_list.get", "shopping_list.add", "shopping_list.remove",
+                                                                            "shopping_list.check"]}
+            states["shopping_list"] = {"items": [{"id": "item_01", "name": c.pick(["nước mắm", "bột giặt", "dầu ăn"]), "quantity": 1, "checked": False}]}
+    if app == "grocery" and "shopping_list" in item["context"]["installed_apps"] and rng.random() < 0.5:
+        a = st["products"][0]
+        kw, q = " ".join(a["name"].split()[:2]).lower(), rng.randint(1, 4)
+        utter, plan, prior = c.say(f"thêm {c.n(q)} {kw} vào {c.pick(['danh sách đi chợ', 'danh sách mua sắm', 'list đi chợ'])}"), \
+            [("shopping_list.add", {"name": kw, "quantity": q})], None
     tools = [t["name"] for a in catalog["apps"] if a["id"] == app for t in a["tools"]]
-    installed = rng.random() > 0.08  # a few requests for an app that is not installed: gold is no call at all
+    installed = rng.random() > 0.08 or prior  # a few requests for an app that is not installed: gold is no call at all
     if installed:
         item["context"]["installed_apps"][app] = {"tools": tools}
         states[app] = st
@@ -427,17 +521,34 @@ def build(i, rng, base_items, envs, catalog, app):
     sim = Simulator({"context": {"current_time": item["context"]["current_time"],
                                  "installed_apps": {a: {"tools": v["tools"], "state": states.get(a, {})} for a, v in item["context"]["installed_apps"].items()}}},
                     catalog)
-    results = []
-    for name, args in plan:
-        seen = json.dumps(results, ensure_ascii=False)
-        if any(k.endswith("_id") and isinstance(v, str) and f'"{v}"' not in seen for k, v in args.items()):
-            return None  # an ID the model could not have read from an earlier result
-        r = sim.call(name, args)
-        if name == "contacts.search" and len(r.get("contacts", [])) != 1:
-            return None  # several (or no) people match: gold would ask instead
-        if not r.get("ok") or r.get("done") is False:
-            return None  # template produced a call the engine refuses or ignores: drop the sample
-        results.append(r)
+    seen = json.dumps([h.get("tool_results") for h in item["history"]], ensure_ascii=False)
+
+    def run(steps):
+        nonlocal seen
+        out = []
+        for name, args in steps:
+            if any(k.endswith("_id") and isinstance(v, str) and f'"{v}"' not in seen for k, v in args.items()):
+                return None  # an ID the model could not have read from an earlier result
+            r = sim.call(name, args)
+            if name == "contacts.search" and len(r.get("contacts", [])) != 1:
+                return None  # several (or no) people match: gold would ask instead
+            if not r.get("ok") or r.get("done") is False:
+                return None  # template produced a call the engine refuses or ignores: drop the sample
+            out.append(r)
+            seen += json.dumps(r, ensure_ascii=False)
+        return out
+
+    if prior:
+        p_utter, p_plan, p_text = prior
+        p_res = run(p_plan)
+        if p_res is None:
+            return None
+        item["history"] += [{"role": "user", "audio": None, "audio_text": p_utter},
+                            {"role": "assistant", "text": p_text, "tool_calls": [{"name": n, "arguments": a} for n, a in p_plan],
+                             "tool_results": p_res}]
+    results = run(plan)
+    if results is None:
+        return None
     item["audio_text"] = utter
     item["label"] = {"tool_calls": [{"name": n, "arguments": a} for n, a in plan], "tool_results": results}
     item["synth_app"] = app
@@ -449,6 +560,7 @@ def main():
     ap.add_argument("--n", type=int, default=600)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--holdout", type=int, default=200, help="train samples never used as a base (the eval holdout)")
+    ap.add_argument("--p-hist", type=float, default=0.6, help="share of samples that keep the base sample's history")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -465,7 +577,7 @@ def main():
     apps = sorted(GENS)
     out, dropped = [], 0
     while len(out) < a.n:
-        it = build(len(out) + 1, rng, base, envs, catalog, apps[len(out) % len(apps)])
+        it = build(len(out) + 1, rng, base, envs, catalog, apps[len(out) % len(apps)], a.p_hist)
         if it is None:
             dropped += 1
             continue
@@ -473,7 +585,9 @@ def main():
     with open(a.out, "w", encoding="utf-8") as f:
         for it in out:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
-    kinds = {"exec": 0, "ask": 0, "empty": 0}
+    kinds = {"exec": 0, "ask": 0, "empty": 0, "multi_turn": sum(bool(it["history"]) for it in out),
+             "follow_up": sum(bool(it["history"]) and it["history"][-1]["role"] == "assistant" and
+                              any(c["name"].split(".")[0] == it["synth_app"] for c in it["history"][-1].get("tool_calls") or []) for it in out)}
     for it in out:
         calls = it["label"]["tool_calls"]
         kinds["empty" if not calls else "ask" if calls[-1]["name"] == "sys.ask_missing_info" else "exec"] += 1

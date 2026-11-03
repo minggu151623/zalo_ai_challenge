@@ -1,0 +1,4 @@
+{"id": "minggu151623/zac-sft5", "title": "zac-sft5", "code_file": "kernel.py", "language": "python",
+ "kernel_type": "script", "is_private": true, "enable_gpu": true, "enable_internet": true,
+ "dataset_sources": ["minggu151623/zac2026-lifemate-data", "minggu151623/zac2026-lifemate-code", "minggu151623/zac-sft3-lora"],
+ "competition_sources": [], "kernel_sources": []}

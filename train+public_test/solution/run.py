@@ -111,8 +111,10 @@ def main():
     ap.add_argument("--tp", type=int, default=1, help="tensor parallel size (2 on Kaggle 2xT4)")
     ap.add_argument("--wave", type=int, default=50, help="episodes per wave; each finished episode is written at once")
     ap.add_argument("--force-call", type=float, default=0.0, help="see vllm_backend; 0 = off")
+    ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt (model trained so)")
     ap.add_argument("--out", default="out")
     a = ap.parse_args()
+    agent.COMPACT = a.compact
 
     sys.path.insert(0, str(ROOT / a.split))
     from zaic_tools import ToolEnv

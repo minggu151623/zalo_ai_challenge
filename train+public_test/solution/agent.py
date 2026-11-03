@@ -84,14 +84,71 @@ def _params(p):
     return out
 
 
+# COMPACT: tools are one-line signatures in the system prompt (~3x fewer tokens than the chat template's JSON schemas)
+COMPACT = False
+TOOLS_HEAD = """# Tools
+Gọi tool bằng <tool_call>{"name": "<tên tool>", "arguments": {...}}</tool_call>, mỗi call một thẻ.
+Kiểu tham số: str; int (số nguyên, không dấu chấm/phẩy/đơn vị); int>0; num; bool; date (YYYY-MM-DD); datetime (ISO 8601 đủ giây và múi giờ, ví dụ 2026-11-11T05:30:00+07:00); phone (giữ nguyên chuỗi số); id←T (ID lấy từ kết quả tool T); a|b (một trong các giá trị); list[...]; {..} là object. Tham số có ? là tuỳ chọn.
+"""
+_ID_FROM = re.compile(r"^ID [^,]*, lấy từ (\S+)$")
+_TYPES = {"string": "str", "integer": "int", "number": "num", "boolean": "bool", "object": "{}"}
+
+
+def _ctype(v):
+    d = v.get("description") or ""
+    if v.get("enum"):
+        t = "|".join(map(str, v["enum"]))
+    elif v.get("type") == "array":
+        t = f"list[{_ctype(v.get('items') or {})}]"
+    elif v.get("type") == "object" and v.get("properties"):
+        t = "{" + _cparams(v) + "}"
+    elif v.get("format") == "date-time" or d.startswith("ISO-8601"):
+        t = "datetime"
+    elif d.startswith("YYYY-MM-DD"):
+        t = "date"
+    elif "giữ nguyên chuỗi" in d.lower():
+        t = "phone"
+    elif m := _ID_FROM.match(d):
+        return f"id←{m.group(1)}"
+    else:
+        t = _TYPES.get(v.get("type"), v.get("type") or "any")
+        if t == "int" and v.get("exclusiveMinimum") == 0:
+            t = "int>0"
+    if v.get("x-ref") and not t.startswith("id"):
+        t += f" (ID trong {v['x-ref']})"
+    if d and not d.startswith(("Số nguyên", "ISO-8601", "YYYY-MM-DD", "Số điện thoại", "Giữ nguyên chuỗi")):
+        t += f" ({d})"
+    return t
+
+
+def _cparams(p):
+    req = set(p.get("required", []))
+    return ", ".join(f"{k}{'' if k in req else '?'}: {_ctype(v)}" for k, v in p.get("properties", {}).items())
+
+
+def compact_tool(t):
+    line = f"{t['name']}({_cparams(t['parameters'])}) {_desc(t)}"
+    if t["parameters"].get("x-one-of"):
+        line += " | bắt buộc một trong: " + " / ".join("+".join(g) for g in t["parameters"]["x-one-of"])
+    return line
+
+
 def build_tools(item, catalog_tools):
     names = [t for a in item["context"]["installed_apps"].values() for t in a["tools"]] + ["sys.ask_missing_info"]
     tools = []
     for n in dict.fromkeys(names):
         t = catalog_tools.get(n)
         if t:
-            tools.append({"type": "function", "function": {"name": n, "description": _desc(t), "parameters": _params(t["parameters"])}})
+            tools.append(compact_tool(t) if COMPACT else
+                         {"type": "function", "function": {"name": n, "description": _desc(t), "parameters": _params(t["parameters"])}})
     return tools
+
+
+def prompt_and_tools(item, tools):
+    """System prompt text and the tools to hand to the chat template (None when they are listed in the prompt)."""
+    if tools and isinstance(tools[0], str):
+        return system_prompt(item) + "\n\n" + TOOLS_HEAD + "\n".join(tools), None
+    return system_prompt(item), tools
 
 
 def _tc(name, args):
@@ -141,13 +198,15 @@ def parse_tool_calls(text):
 
 class AgentState:
     def __init__(self, item, env, tools, user_texts, final_text):
+        sys_text, tools = prompt_and_tools(item, tools)
         self.item, self.env, self.tools = item, env, tools
-        self.messages = [{"role": "system", "content": system_prompt(item)}] + history_messages(item, user_texts) + \
+        self.messages = [{"role": "system", "content": sys_text}] + history_messages(item, user_texts) + \
                         [{"role": "user", "content": final_text}]
         self.done = False
         self.steps = 0
         self.retries = 0
         self.done_calls = set()
+        self.failed_writes = set()
 
     def step(self, text):
         """Consume one assistant output; execute its tool calls; decide whether the episode is over."""
@@ -169,6 +228,9 @@ class AgentState:
             key = name + json.dumps(args, sort_keys=True, ensure_ascii=False)
             if key in self.done_calls:
                 res = {"ok": True, "note": "đã gọi tool này với cùng tham số, dùng kết quả trước"}
+            elif key in self.failed_writes:  # the same refused write again: it would be logged twice, so end here
+                res = {"ok": True, "note": "thao tác này đã thất bại ở trên, không thực hiện lại"}
+                stop = True
             else:
                 # validate first: a rejected call would be logged and count as unmatched in the score
                 v = self.env.validate(name, args)
@@ -179,6 +241,8 @@ class AgentState:
                     res = self.env.call(name, args)
                     if self.env.kind(name) == "read":  # repeated writes can be intended (redeem twice)
                         self.done_calls.add(key)
+                    elif isinstance(res, dict) and res.get("done") is False:
+                        self.failed_writes.add(key)
             if name == "sys.ask_missing_info" and res.get("ok"):
                 stop = True
             self.messages.append({"role": "tool", "content": _clip(res, RESULT_CHARS)})

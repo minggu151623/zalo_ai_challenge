@@ -22,7 +22,8 @@ CLOSE_NONE = "Dạ, việc này em chưa làm được trên các ứng dụng h
 
 
 def episode(item, tools, user_hist, user_final):
-    msgs = [{"role": "system", "content": agent.system_prompt(item)}] + agent.history_messages(item, user_hist) + \
+    sys_text, tools = agent.prompt_and_tools(item, tools)
+    msgs = [{"role": "system", "content": sys_text}] + agent.history_messages(item, user_hist) + \
            [{"role": "user", "content": user_final}]
     calls, results = item["label"]["tool_calls"], item["label"]["tool_results"]
     for c, r in zip(calls, results):
@@ -46,7 +47,9 @@ def main():
     ap.add_argument("--extra", help="train-format samples from synth.py (apps seen only in public_test's catalog)")
     ap.add_argument("--holdout", type=int, default=200, help="samples kept out for evaluation (same draw as run.py --limit)")
     ap.add_argument("--holdout-seed", type=int, default=0)
+    ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt")
     a = ap.parse_args()
+    agent.COMPACT = a.compact
 
     cat = json.load(open(ROOT / "train/train_tools_catalog.json", encoding="utf-8"))
     ctools = {t["name"]: t for app in cat["apps"] for t in app["tools"]}
@@ -73,7 +76,8 @@ def main():
         if a.extra:
             for line in open(a.extra, encoding="utf-8"):
                 it = json.loads(line)
-                f.write(json.dumps(episode(it, agent.build_tools(it, ctools), [], it["audio_text"]), ensure_ascii=False) + "\n")
+                hist = [h["audio_text"] for h in it["history"] if h["role"] == "user"]
+                f.write(json.dumps(episode(it, agent.build_tools(it, ctools), hist, it["audio_text"]), ensure_ascii=False) + "\n")
                 n += 1
     print(f"{n} SFT samples ({len(held)} held out) -> {a.out}")
 
