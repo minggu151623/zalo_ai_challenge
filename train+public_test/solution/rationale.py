@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 
 INSTRUCTIONS = """Write the private reasoning the agent has right BEFORE taking the next action shown above, i.e. why that action is the right next step given only the information above (instructions, context, history, request, and results of the steps already taken).
 - 1 or 2 short sentences, at most 35 words, in English; keep Vietnamese names, quoted words and values verbatim.
@@ -29,11 +31,23 @@ def steps_of(msgs):
     return last_user, [i for i in range(last_user + 1, len(msgs)) if msgs[i]["role"] == "assistant"]
 
 
+def _trim_tools(sys_text, msgs):
+    """Keep only the tool lines of apps this episode calls (plus sys.*): prompts are ~2x shorter. Episodes without any
+    call keep every tool, since their reasoning is about what the installed apps cannot do."""
+    apps = {tc["function"]["name"].split(".")[0] for m in msgs for tc in m.get("tool_calls") or []}
+    if not apps or "\n# Tools\n" not in sys_text:
+        return sys_text
+    head, tools = sys_text.split("\n# Tools\n", 1)
+    lines = tools.split("\n")
+    keep = [l for l in lines if not re.match(r"^[a-z_]+\.[a-z_]+\(", l) or l.split(".")[0] in apps | {"sys"}]
+    return head + "\n# Tools (only the apps relevant here)\n" + "\n".join(keep)
+
+
 def build_prompts(sample):
     """One prompt per target assistant message; each shows only what the agent knows before that step."""
     msgs = sample["messages"]
     last_user, idx = steps_of(msgs)
-    out = ["# Agent instructions and context", msgs[0]["content"]]
+    out = ["# Agent instructions and context", _trim_tools(msgs[0]["content"], msgs)]
     if sample.get("tools"):  # non-compact samples hand JSON schemas to the chat template instead
         out += ["# Tools"] + [json.dumps(t["function"], ensure_ascii=False) for t in sample["tools"]]
     hist = msgs[1:last_user]
@@ -64,7 +78,7 @@ def build_prompts(sample):
             done.append(f"{n}. {nxt}")
             j = i + 1
             while j < len(msgs) and msgs[j]["role"] == "tool":
-                done.append(f"   result: {msgs[j]['content'][:1500]}")
+                done.append(f"   result: {msgs[j]['content'][:1000]}")
                 j += 1
     return prompts
 
@@ -83,10 +97,13 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--model", default="Qwen/Qwen3-14B-AWQ")
     ap.add_argument("--tp", type=int, default=1)
-    ap.add_argument("--max-model-len", type=int, default=12288)
+    ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--gpu-util", type=float, default=0.9)
     ap.add_argument("--dump", type=int, default=0, help="print this many prompts and exit")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--shard", type=int, default=0, help="this process takes samples[shard::nshard]")
+    ap.add_argument("--nshard", type=int, default=1)
+    ap.add_argument("--chunk", type=int, default=100, help="samples per generate call; output is appended per chunk")
     a = ap.parse_args()
 
     samples, seen = [], set()
@@ -97,11 +114,14 @@ def main():
             samples.append(s)
     if a.limit:
         samples = samples[:a.limit]
-    per = [build_prompts(s) for s in samples]
-    flat = [(si, k, p) for si, ps in enumerate(per) for k, p in enumerate(ps)]
-    print(f"{len(samples)} samples, {len(flat)} step prompts", flush=True)
+    samples = samples[a.shard::a.nshard]
+    done_ids = {json.loads(l)["id"] for l in open(a.out, encoding="utf-8")} if a.out and os.path.exists(a.out) else set()
+    samples = [x for x in samples if x["id"] not in done_ids]
+    per = [build_prompts(x) for x in samples]
+    print(f"{len(samples)} samples to do ({len(done_ids)} already in {a.out}), {sum(map(len, per))} step prompts",
+          flush=True)
     if a.dump:
-        for _, _, p in flat[:a.dump]:
+        for p in [p for ps in per for p in ps][:a.dump]:
             print(p, "\n" + "=" * 80)
         return
 
@@ -110,33 +130,33 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     llm = LLM(a.model, tensor_parallel_size=a.tp, max_model_len=a.max_model_len, gpu_memory_utilization=a.gpu_util,
               enable_prefix_caching=True, seed=0, dtype="half")
-    texts = []
-    for _, _, p in flat:
-        kw = {"enable_thinking": False} if "Qwen3-" in a.model and "2507" not in a.model else {}
-        t = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=False, **kw)
-        ids = tok(t, add_special_tokens=False)["input_ids"]
-        texts.append(t if len(ids) < a.max_model_len - 1200 else None)
-    result = [None] * len(flat)
-    for attempt, temp in enumerate((0.0, 0.7, 0.7)):
-        todo = [i for i in range(len(flat)) if result[i] is None and texts[i] is not None]
-        if not todo:
-            break
-        sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0, seed=attempt, max_tokens=120)
-        outs = llm.generate([texts[i] for i in todo], sp)
-        for i, o in zip(todo, outs):
-            result[i] = clean(o.outputs[0].text)
-        print(f"attempt {attempt}: {sum(r is not None for r in result)}/{len(flat)} steps annotated", flush=True)
-    by = {}
-    for (si, k, _), r in zip(flat, result):
-        by.setdefault(si, [None] * len(per[si]))[k] = r
-    n = 0
-    with open(a.out, "w", encoding="utf-8") as f:
-        for si, steps in sorted(by.items()):
-            if all(steps):
-                f.write(json.dumps({"id": samples[si]["id"], "steps": steps}, ensure_ascii=False) + "\n")
-                n += 1
-    print(f"{n}/{len(samples)} samples fully annotated -> {a.out}", flush=True)
+    kw = {"enable_thinking": False} if "Qwen3-" in a.model and "2507" not in a.model else {}
 
+    def chat(p):
+        t = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=False, **kw)
+        return t if len(tok(t, add_special_tokens=False)["input_ids"]) < a.max_model_len - 200 else None
+
+    total = 0
+    for c0 in range(0, len(samples), a.chunk):  # results are appended per chunk, so a killed run keeps its progress
+        flat = [(si, k, chat(p)) for si in range(c0, min(c0 + a.chunk, len(samples))) for k, p in enumerate(per[si])]
+        result = [None] * len(flat)
+        for attempt, temp in enumerate((0.0, 0.7, 0.7)):
+            todo = [i for i in range(len(flat)) if result[i] is None and flat[i][2] is not None]
+            if not todo:
+                break
+            sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0, seed=attempt, max_tokens=100)
+            outs = llm.generate([flat[i][2] for i in todo], sp, use_tqdm=False)
+            for i, o in zip(todo, outs):
+                result[i] = clean(o.outputs[0].text)
+        by = {}
+        for (si, k, _), r in zip(flat, result):
+            by.setdefault(si, [None] * len(per[si]))[k] = r
+        with open(a.out, "a", encoding="utf-8") as f:
+            for si, steps in sorted(by.items()):
+                if all(steps):
+                    f.write(json.dumps({"id": samples[si]["id"], "steps": steps}, ensure_ascii=False) + "\n")
+                    total += 1
+        print(f"samples {min(c0 + a.chunk, len(samples))}/{len(samples)} done, {total} fully annotated", flush=True)
 
 if __name__ == "__main__":
     main()

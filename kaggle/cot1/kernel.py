@@ -1,4 +1,4 @@
-# Kaggle job (2xT4): cot1 = short chain-of-thought SFT. Qwen3-14B-AWQ writes a one- or two-sentence reasoning line
+# Kaggle job (2xT4): cot1 = short chain-of-thought SFT. Qwen3-14B-AWQ (kernel zac-rat) wrote a one- or two-sentence reasoning line
 # for every gold step (rationale.py: each prompt shows only what the agent knows before that step), sft_data.py puts it
 # in front of the step's tool call, and sftc3's adapter (kernel output huangvu1/zac-sftc3, holdout 64.21) trains one
 # more epoch on that data at lr 5e-5 so the agent reasons briefly before every action. Then the 200-sample holdout
@@ -11,7 +11,7 @@ import sys
 
 W = "/tmp/zac"
 OUT = "/kaggle/working"
-TRAIN_MIN = 420  # 12 h session: setup + rationales ~2 h, then merge + two holdout runs ~1.5 h
+TRAIN_MIN = 540  # 12 h session: setup ~20 min, merge + vllm + two holdout runs ~2 h
 
 
 def sh(cmd):
@@ -47,18 +47,10 @@ asr_hold, asr_cv = find("asr_hold_ft.jsonl"), find("asr_train_cv.jsonl")
 init = os.path.dirname(glob.glob("/kaggle/input/**/lora/adapter_model.safetensors", recursive=True)[0])
 print("init adapter:", init, flush=True)
 
-# 1) rationales (vLLM first: it pins its own torch; transformers/peft are upgraded after)
-vllm_setup()
+# 1) rationales from kernel huangvu1/zac-rat (Qwen3-14B-AWQ, data generation only)
+RAT = find("rationale.jsonl")
+sh(f"wc -l {RAT}")
 sh(f"cd {W} && python solution/synth.py --n 1100 --out {W}/synth.jsonl")
-sh(f"cd {W} && python solution/sft_data.py --compact --text-only --extra {W}/synth.jsonl --out {W}/sft_text.jsonl")
-RAT = f"{OUT}/rationale.jsonl"
-rc = sh(f"cd {W} && python -u solution/rationale.py --data {W}/sft_text.jsonl --out {RAT} --model Qwen/Qwen3-14B-AWQ --tp 2")
-if rc != 0 or not os.path.exists(RAT):
-    rc = sh(f"cd {W} && python -u solution/rationale.py --data {W}/sft_text.jsonl --out {RAT} "
-            f"--model Qwen/Qwen3-4B-Instruct-2507 --tp 2")
-if not os.path.exists(RAT):
-    sys.exit("rationale generation failed")
-sh(f"wc -l {RAT}; head -c 3000 {RAT}")
 
 # 2) CoT SFT, one epoch from sftc3
 sh('pip install -q -U "transformers>=4.56,<5" peft 2>&1 | tail -2')
@@ -73,6 +65,7 @@ if not os.path.exists(f"{lora}/adapter_config.json"):
     sys.exit("training failed")
 if sh(f"cd {W} && python solution/train_sft.py --merge {lora} --out {W}/merged") != 0:
     sys.exit("merge failed")
+vllm_setup()
 
 
 # 3) holdout: ASR text, then gold text
