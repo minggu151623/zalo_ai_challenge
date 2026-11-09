@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asr import fold_ids, jobs_for, read_wav  # noqa: E402
 
@@ -60,6 +62,9 @@ def train(a):
 
     model = WhisperForConditionalGeneration.from_pretrained(a.model, dtype=torch.float16).cuda(dev)
     model.config.use_cache = False
+    if a.specaug:  # Whisper's built-in SpecAugment (time and frequency masks on the log-mel input, training only)
+        model.config.update(dict(apply_spec_augment=True, mask_time_prob=a.specaug, mask_time_length=10,
+                                 mask_feature_prob=a.specaug, mask_feature_length=10))
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(r=a.rank, lora_alpha=2 * a.rank, lora_dropout=0.05, target_modules=TARGETS))
@@ -72,8 +77,17 @@ def train(a):
     scaler = torch.amp.GradScaler()
     sot = model.config.decoder_start_token_id
 
+    rng = random.Random(a.seed + 1000 * rank)
+
+    def speed(w):  # Kaldi-style speed perturbation (tempo and pitch together) by linear resampling
+        f = rng.uniform(1 - a.speed, 1 + a.speed)
+        return np.interp(np.arange(0, len(w) - 1, f), np.arange(len(w)), w).astype(np.float32)
+
     def batch(pairs):
-        feats = proc.feature_extractor([read_wav(p) for p, _ in pairs], sampling_rate=16000, return_tensors="pt").input_features
+        wavs = [read_wav(p) for p, _ in pairs]
+        if a.speed:
+            wavs = [speed(w) for w in wavs]
+        feats = proc.feature_extractor(wavs, sampling_rate=16000, return_tensors="pt").input_features
         lab = [proc.tokenizer(t).input_ids for _, t in pairs]
         lab = [l[1:] if l and l[0] == sot else l for l in lab]  # the model prepends decoder_start itself
         n = max(map(len, lab))
@@ -154,6 +168,8 @@ def main():
     ap.add_argument("--skip-fold", type=int, help="also leave out this train fold, to transcribe it later (asr.py --fold)")
     ap.add_argument("--folds", type=int, default=2)
     ap.add_argument("--merge", help="adapter dir to merge into --model")
+    ap.add_argument("--specaug", type=float, default=0.0, help="SpecAugment time/feature mask prob (0 = off)")
+    ap.add_argument("--speed", type=float, default=0.0, help="random speed perturbation in [1-x, 1+x] (0 = off)")
     a = ap.parse_args()
     merge(a) if a.merge else train(a)
 

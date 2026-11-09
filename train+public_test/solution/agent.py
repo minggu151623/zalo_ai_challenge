@@ -211,6 +211,12 @@ class AgentState:
     def step(self, text):
         """Consume one assistant output; execute its tool calls; decide whether the episode is over."""
         self.steps += 1
+        think = None
+        if "</think>" in text:  # thinking model: keep the reasoning out of the context (kept as _think for traces)
+            think, text = text.split("</think>", 1)
+            think = think.replace("<think>", "").strip()
+        elif "<think>" in text:  # ran out of tokens while still thinking
+            think, text = text.replace("<think>", "").strip(), ""
         calls, bad = parse_tool_calls(text)
         content = text.split("<tool_call>")[0].strip()
         if not calls:
@@ -219,10 +225,11 @@ class AgentState:
                 self.messages.append({"role": "assistant", "content": text})
                 self.messages.append({"role": "user", "content": "Tool call không phải JSON hợp lệ, hãy gọi lại đúng định dạng."})
             else:
-                self.messages.append({"role": "assistant", "content": content})
+                self.messages.append({"role": "assistant", "content": content, **({"_think": think} if think else {})})
                 self.done = True
             return
-        self.messages.append({"role": "assistant", "content": content, "tool_calls": [_tc(n, a) for n, a in calls]})
+        self.messages.append({"role": "assistant", "content": content, "tool_calls": [_tc(n, a) for n, a in calls],
+                              **({"_think": think} if think else {})})
         stop = False
         for name, args in calls:
             key = name + json.dumps(args, sort_keys=True, ensure_ascii=False)

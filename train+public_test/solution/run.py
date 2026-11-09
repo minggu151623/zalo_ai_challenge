@@ -54,8 +54,9 @@ def oracle_backend(items):
     return generate
 
 
-def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, first_log=None):
-    """force_call > 0: when a reply to a user turn has no tool call but the model gave <tool_call> at least this
+def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, first_log=None, max_tokens=768, temp=0.0):
+    """max_tokens/temp: per-reply budget and sampling temperature (a thinking model needs room to reason and temp > 0).
+    force_call > 0: when a reply to a user turn has no tool call but the model gave <tool_call> at least this
     probability as its first token, the reply is regenerated starting with <tool_call> (curbs false refusals).
     first_log: file to append {"id", "p_tc", "forced"} for those replies, to calibrate force_call."""
     from vllm import LLM, SamplingParams
@@ -63,7 +64,7 @@ def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, fi
               enable_prefix_caching=True, seed=0, tensor_parallel_size=tp)
     tok = llm.get_tokenizer()
     tc_id = tok.convert_tokens_to_ids("<tool_call>")
-    sp = SamplingParams(temperature=0.0, max_tokens=768, seed=0, logprobs=20)
+    sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0, max_tokens=max_tokens, seed=0, logprobs=20)
     flog = open(first_log, "a", encoding="utf-8") if first_log else None
 
     def generate(batch, tools):
@@ -72,8 +73,8 @@ def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, fi
             clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs]
             p = tok.apply_chat_template(clean, tools=t, add_generation_prompt=True, tokenize=False)
             ids = tok(p).input_ids
-            if len(ids) > max_model_len - 800:
-                p = tok.decode(ids[-(max_model_len - 800):])  # crude guard; real budget control is in agent.py
+            if len(ids) > max_model_len - max_tokens - 32:
+                p = tok.decode(ids[-(max_model_len - max_tokens - 32):])  # crude guard; real budget control is in agent.py
             prompts.append(p)
         outs = llm.generate(prompts, sp, use_tqdm=False)
         texts = [o.outputs[0].text for o in outs]
@@ -111,6 +112,8 @@ def main():
     ap.add_argument("--tp", type=int, default=1, help="tensor parallel size (2 on Kaggle 2xT4)")
     ap.add_argument("--wave", type=int, default=50, help="episodes per wave; each finished episode is written at once")
     ap.add_argument("--force-call", type=float, default=0.0, help="see vllm_backend; 0 = off")
+    ap.add_argument("--max-tokens", type=int, default=768, help="per assistant reply (raise for a thinking model)")
+    ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt (model trained so)")
     ap.add_argument("--out", default="out")
     a = ap.parse_args()
@@ -146,7 +149,8 @@ def main():
         print("nothing to do", flush=True)
         return
     gen = oracle_backend(items) if a.backend == "oracle" else vllm_backend(
-        a.model, a.max_model_len, a.gpu_util, a.dtype, a.tp, a.force_call, str(out / "first_token.jsonl"))
+        a.model, a.max_model_len, a.gpu_util, a.dtype, a.tp, a.force_call, str(out / "first_token.jsonl"),
+        a.max_tokens, a.temp)
     t0 = time.time()
     n_done = [0]
 
