@@ -21,6 +21,18 @@ CLOSE_ASK = "Dạ, anh/chị cho em thêm thông tin để em làm tiếp nhé."
 CLOSE_NONE = "Dạ, việc này em chưa làm được trên các ứng dụng hiện có ạ."
 
 
+def add_rationale(ep, steps):
+    """Prefix each assistant message after the final user turn with its reasoning line (rationale.py output)."""
+    msgs = ep["messages"]
+    last_user = max(i for i, m in enumerate(msgs) if m["role"] == "user")
+    idx = [i for i in range(last_user + 1, len(msgs)) if msgs[i]["role"] == "assistant"]
+    if len(idx) != len(steps):
+        return ep
+    for i, r in zip(idx, steps):
+        msgs[i] = {**msgs[i], "content": r + ("\n" + msgs[i]["content"] if msgs[i]["content"] else "")}
+    return ep
+
+
 def episode(item, tools, user_hist, user_final):
     sys_text, tools = agent.prompt_and_tools(item, tools)
     msgs = [{"role": "system", "content": sys_text}] + agent.history_messages(item, user_hist) + \
@@ -48,6 +60,8 @@ def main():
     ap.add_argument("--holdout", type=int, default=200, help="samples kept out for evaluation (same draw as run.py --limit)")
     ap.add_argument("--holdout-seed", type=int, default=0)
     ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt")
+    ap.add_argument("--rationale", help="rationale.py output: reasoning line before every target assistant message")
+    ap.add_argument("--text-only", action="store_true", help="skip ASR copies (input for rationale.py)")
     a = ap.parse_args()
     agent.COMPACT = a.compact
 
@@ -59,6 +73,12 @@ def main():
     items = [json.loads(l) for l in open(ROOT / "train/train.jsonl", encoding="utf-8")]
     held = {d["id"] for d in random.Random(a.holdout_seed).sample(items, a.holdout)} if a.holdout else set()
     asr = {d["id"]: d for d in map(json.loads, open(a.asr, encoding="utf-8"))} if a.asr else {}
+    rat = {d["id"]: d["steps"] for d in map(json.loads, open(a.rationale, encoding="utf-8"))} if a.rationale else {}
+
+    def write(f, ep):
+        if ep["id"] in rat:
+            ep = add_rationale(ep, rat[ep["id"]])
+        f.write(json.dumps(ep, ensure_ascii=False) + "\n")
 
     n = 0
     with open(a.out, "w", encoding="utf-8") as f:
@@ -67,17 +87,17 @@ def main():
                 continue
             tools = agent.build_tools(it, ctools)
             hist = [h["audio_text"] for h in it["history"] if h["role"] == "user"]
-            f.write(json.dumps(episode(it, tools, hist, it["audio_text"]), ensure_ascii=False) + "\n")
+            write(f, episode(it, tools, hist, it["audio_text"]))
             n += 1
-            if it["id"] in asr:
+            if it["id"] in asr and not a.text_only:
                 r = asr[it["id"]]
-                f.write(json.dumps(episode(it, tools, r["history"], r["final"]), ensure_ascii=False) + "\n")
+                write(f, episode(it, tools, r["history"], r["final"]))
                 n += 1
         if a.extra:
             for line in open(a.extra, encoding="utf-8"):
                 it = json.loads(line)
                 hist = [h["audio_text"] for h in it["history"] if h["role"] == "user"]
-                f.write(json.dumps(episode(it, agent.build_tools(it, ctools), hist, it["audio_text"]), ensure_ascii=False) + "\n")
+                write(f, episode(it, agent.build_tools(it, ctools), hist, it["audio_text"]))
                 n += 1
     print(f"{n} SFT samples ({len(held)} held out) -> {a.out}")
 
