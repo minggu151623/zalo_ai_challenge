@@ -2,7 +2,7 @@
 # for every gold step (rationale.py: each prompt shows only what the agent knows before that step), sft_data.py puts it
 # in front of the step's tool call, and sftc3's adapter (kernel output huangvu1/zac-sftc3, holdout 64.21) trains one
 # more epoch on that data at lr 5e-5 so the agent reasons briefly before every action. Then the 200-sample holdout
-# with ASR text (compare to sftc3 64.21) and with gold text (sftc3 71.59).
+# with ASR text (compare to sftc3 64.21) and with gold text (sftc3 71.59), then public_test (submission for the user).
 import glob
 import os
 import shutil
@@ -11,7 +11,7 @@ import sys
 
 W = "/tmp/zac"
 OUT = "/kaggle/working"
-TRAIN_MIN = 540  # 12 h session: setup ~20 min, merge + vllm + two holdout runs ~2 h
+TRAIN_MIN = 480  # 12 h session: setup ~20 min, merge + vllm + two holdout runs + public ~3 h (one epoch needs ~5.5 h)
 
 
 def sh(cmd):
@@ -43,7 +43,7 @@ if sh("nvidia-smi -L") != 0:
 os.makedirs(W, exist_ok=True)
 sh(f"tar xzf {find('zac_text.tgz')} -C {W} 2>/dev/null")
 shutil.copytree(os.path.dirname(find("rationale.py")), f"{W}/solution", dirs_exist_ok=True)
-asr_hold, asr_cv = find("asr_hold_ft.jsonl"), find("asr_train_cv.jsonl")
+asr_hold, asr_cv, asr_pub = find("asr_hold_ft.jsonl"), find("asr_train_cv.jsonl"), find("asr_public_ft.jsonl")
 init = os.path.dirname(glob.glob("/kaggle/input/**/lora/adapter_model.safetensors", recursive=True)[0])
 print("init adapter:", init, flush=True)
 
@@ -79,3 +79,9 @@ for name, text in (("cot200_asr", asr_hold), ("cot200_gold", "gold")):
     E = f"{OUT}/{name}"
     run(f"--split train --limit 200 --seed 0 --text {text}", E)
     sh(f"cd {W} && python solution/score.py {E}/submission.jsonl --details {E}/details.jsonl | tee {E}/score.txt")
+
+# 4) public_test with ASR text, so a submission is ready if the holdout improves
+P = f"{OUT}/public"
+rc = run(f"--split public_test --text {asr_pub}", P)
+sh(f"wc -l {P}/submission.jsonl; cd {W}/public_test && python -m zaic_tools --split public_test --root .. --validate {P}/submission.jsonl | tail -5")
+sys.exit(rc)
