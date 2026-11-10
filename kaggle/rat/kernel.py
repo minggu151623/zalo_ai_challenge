@@ -43,7 +43,7 @@ sh(f"cd {W} && python solution/synth.py --n 1100 --out {W}/synth.jsonl")
 sh(f"cd {W} && python solution/sft_data.py --compact --text-only --extra {W}/synth.jsonl --out {W}/sft_text.jsonl")
 base = (f"cd {W} && python -u solution/rationale.py --data {W}/sft_text.jsonl --model Qwen/Qwen3-14B-AWQ "
         f"--gpu-util 0.92 --max-model-len 6144 --nshard 2")
-procs = [subprocess.Popen(f"CUDA_VISIBLE_DEVICES={k} {base} --shard {k} --out {OUT}/rat{k}.jsonl 2>&1 | "
+procs = [subprocess.Popen(f"export CUDA_VISIBLE_DEVICES={k}; {base} --shard {k} --out {OUT}/rat{k}.jsonl 2>&1 | "
                           f"grep -vE 'INFO|WARNING|it/s]' | sed 's/^/[gpu{k}] /'", shell=True) for k in range(2)]
 for p in procs:
     p.wait()
