@@ -243,12 +243,73 @@ def author(a):
     print(f"{len(items)} episodes -> {a.split_dir}; dropped {why}; kinds",
           {k[0]: sum(x['synth_kind'] == k[0] for x in items) for k in KINDS}, flush=True)
 
+JUDGE = """You are checking one training example for a Vietnamese voice assistant that operates apps through tool calls.
+Above: the context, the tools, the data in the apps, the earlier conversation, the user's new request, and the calls proposed
+as the gold answer with their real results. The example is CORRECT only if ALL hold:
+1. Every call is needed for the request; nothing extra (no unrequested alerts, reads whose result is not needed, repeats).
+2. Every argument value is said by the user, in the context/earlier conversation, or taken from an earlier result; none is invented or guessed (stops, routes, amounts, times, places, quantities).
+3. Conditions in the request are checked with a read call and decided correctly from its result.
+4. Nothing the user asked for is left undone, unless a required value is missing, in which case sys.ask_missing_info names the right tool and parameter(s).
+5. Dates/times match what the user said, relative to the current time.
+Answer with one word: CORRECT or WRONG."""
+
+
+def judge_prompt(it, states, ctools):
+    used = {c["name"].split(".")[0] for c in it["label"]["tool_calls"]} | {it["synth_app"]}
+    lines = [agent.system_prompt(it), "", "# Tools"]
+    lines += [agent.compact_tool(ctools[n]) for a in sorted(used) for n in (it["context"]["installed_apps"].get(a) or {}).get("tools", []) if n in ctools]
+    lines += ["", "# Data in the apps"] + [f"{a}: {agent._clip(states.get(a, {}), 2500)}" for a in sorted(used) if a in states]
+    if it["history"]:
+        lines.append("\n# Earlier conversation")
+        for h in it["history"]:
+            if h["role"] == "user":
+                lines.append(f"User: {h['audio_text']}")
+            else:
+                lines += ["Assistant calls " + json.dumps(c, ensure_ascii=False) for c in h.get("tool_calls") or []]
+                if h.get("text"):
+                    lines.append(f"Assistant: {h['text']}")
+    lines += ["\n# New request", f"User: {it['audio_text']}", "\n# Proposed gold calls"]
+    for c, r in zip(it["label"]["tool_calls"], it["label"]["tool_results"]):
+        lines += ["call " + json.dumps(c, ensure_ascii=False), "  result " + agent._clip(r, 600)]
+    return "\n".join(lines + ["", JUDGE])
+
+
+def judge(a):
+    import math
+    d = ROOT / a.split_dir
+    name = d.name
+    items = [json.loads(l) for l in open(d / f"{name}.jsonl", encoding="utf-8")][a.shard::a.nshard]
+    catalog = json.load(open(d / f"{name}_tools_catalog.json", encoding="utf-8"))
+    ctools = {t["name"]: t for x in catalog["apps"] for t in x["tools"]}
+    states = {it["id"]: json.load(open(d / f"{name}_environment" / it["id"] / "state.json", encoding="utf-8")) for it in items}
+    from vllm import LLM, SamplingParams
+    llm = LLM(a.model, max_model_len=a.max_model_len, gpu_memory_utilization=a.gpu_util, enable_prefix_caching=True,
+              seed=0, dtype="half")
+    tok = llm.get_tokenizer()
+    kw = {"enable_thinking": False} if "Qwen3-" in a.model and "2507" not in a.model else {}
+    prompts = [tok.apply_chat_template([{"role": "user", "content": judge_prompt(it, states[it["id"]], ctools)}],
+                                       add_generation_prompt=True, tokenize=False, **kw) for it in items]
+    ok_ids = {tok.encode(w, add_special_tokens=False)[0] for w in ("CORRECT", " CORRECT")}
+    bad_ids = {tok.encode(w, add_special_tokens=False)[0] for w in ("WRONG", " WRONG")}
+    keep_i = [i for i, p in enumerate(prompts) if len(tok(p).input_ids) < a.max_model_len - 8]
+    outs = llm.generate([prompts[i] for i in keep_i], SamplingParams(temperature=0, max_tokens=1, logprobs=20))
+    with open(a.out, "w", encoding="utf-8") as f:
+        for i, o in zip(keep_i, outs):
+            lp = o.outputs[0].logprobs[0]
+            pc = sum(math.exp(v.logprob) for k, v in lp.items() if k in ok_ids)
+            pw = sum(math.exp(v.logprob) for k, v in lp.items() if k in bad_ids)
+            f.write(json.dumps({"id": items[i]["id"], "p": pc / max(pc + pw, 1e-9)}) + "\n")
+    print(f"judged {len(keep_i)} of {len(items)} -> {a.out}", flush=True)
+
 
 def keep(a):
     d = ROOT / a.split_dir
     name = d.name
     items = {it["id"]: it for it in map(json.loads, open(d / f"{name}.jsonl", encoding="utf-8"))}
-    ok = [x["id"] for x in map(json.loads, open(a.details, encoding="utf-8")) if x["score"] >= 1.0 and x["id"] in items]
+    if a.judge:
+        ok = [x["id"] for x in map(json.loads, open(a.judge, encoding="utf-8")) if x["p"] >= a.min_p and x["id"] in items]
+    else:
+        ok = [x["id"] for x in map(json.loads, open(a.details, encoding="utf-8")) if x["score"] >= 1.0 and x["id"] in items]
     random.Random(0).shuffle(ok)
     dev, train = ok[:a.dev], ok[a.dev:]
     with open(a.out, "w", encoding="utf-8") as f:
@@ -277,11 +338,21 @@ def main():
     p.add_argument("--dump", type=int, default=0)
     q = sub.add_parser("keep")
     q.add_argument("--split-dir", default="synv")
-    q.add_argument("--details", required=True)
+    q.add_argument("--details", help="score.py details of a solver run (keep score 1)")
+    q.add_argument("--judge", help="judge output (keep p >= --min-p) instead of --details")
+    q.add_argument("--min-p", type=float, default=0.8)
     q.add_argument("--dev", type=int, default=300)
     q.add_argument("--out", required=True)
+    j = sub.add_parser("judge")
+    j.add_argument("--split-dir", default="synv")
+    j.add_argument("--model", default="Qwen/Qwen3-14B-AWQ")
+    j.add_argument("--max-model-len", type=int, default=8192)
+    j.add_argument("--gpu-util", type=float, default=0.92)
+    j.add_argument("--shard", type=int, default=0)
+    j.add_argument("--nshard", type=int, default=1)
+    j.add_argument("--out", required=True)
     a = ap.parse_args()
-    author(a) if a.cmd == "author" else keep(a)
+    {"author": author, "keep": keep, "judge": judge}[a.cmd](a)
 
 
 if __name__ == "__main__":
