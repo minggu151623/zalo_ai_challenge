@@ -65,6 +65,8 @@ def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, fi
               enable_prefix_caching=True, seed=0, tensor_parallel_size=tp)
     tok = llm.get_tokenizer()
     tc_id = tok.convert_tokens_to_ids("<tool_call>")
+    # hybrid Qwen3 (e.g. Qwen3-14B-AWQ as a data-generation solver): no thinking; 2507 models have one mode
+    ckw = {"enable_thinking": False} if "Qwen3-" in model and "2507" not in model else {}
     sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0, max_tokens=max_tokens, seed=0, logprobs=20)
     flog = open(first_log, "a", encoding="utf-8") if first_log else None
 
@@ -74,7 +76,7 @@ def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, fi
             clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs]
             if hide_reasoning:  # CoT model: drop earlier steps' reasoning so greedy decoding cannot copy it forward
                 clean = [{**m, "content": ""} if m["role"] == "assistant" and m.get("tool_calls") else m for m in clean]
-            p = tok.apply_chat_template(clean, tools=t, add_generation_prompt=True, tokenize=False)
+            p = tok.apply_chat_template(clean, tools=t, add_generation_prompt=True, tokenize=False, **ckw)
             ids = tok(p).input_ids
             if len(ids) > max_model_len - max_tokens - 32:
                 p = tok.decode(ids[-(max_model_len - max_tokens - 32):])  # crude guard; real budget control is in agent.py
@@ -117,6 +119,8 @@ def main():
     ap.add_argument("--force-call", type=float, default=0.0, help="see vllm_backend; 0 = off")
     ap.add_argument("--max-tokens", type=int, default=768, help="per assistant reply (raise for a thinking model)")
     ap.add_argument("--temp", type=float, default=0.0)
+    ap.add_argument("--shard", type=int, default=0, help="this process runs items[shard::nshard]")
+    ap.add_argument("--nshard", type=int, default=1)
     ap.add_argument("--hide-reasoning", action="store_true",
                     help="blank the text before earlier tool calls in the prompt (traces keep it)")
     ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt (model trained so)")
@@ -132,7 +136,7 @@ def main():
     asr = {}
     if a.text != "gold":
         asr = {d["id"]: d for d in map(json.loads, open(a.text, encoding="utf-8"))}
-    items = load_items(a.split, a.limit, a.seed)
+    items = load_items(a.split, a.limit, a.seed)[a.shard::a.nshard]
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     sub_path, trace_path = out / "submission.jsonl", out / "traces.jsonl"
