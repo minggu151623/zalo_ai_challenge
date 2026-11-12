@@ -54,7 +54,8 @@ def oracle_backend(items):
     return generate
 
 
-def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, first_log=None, max_tokens=768, temp=0.0):
+def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, first_log=None, max_tokens=768, temp=0.0,
+                 hide_reasoning=False):
     """max_tokens/temp: per-reply budget and sampling temperature (a thinking model needs room to reason and temp > 0).
     force_call > 0: when a reply to a user turn has no tool call but the model gave <tool_call> at least this
     probability as its first token, the reply is regenerated starting with <tool_call> (curbs false refusals).
@@ -71,6 +72,8 @@ def vllm_backend(model, max_model_len, gpu_util, dtype, tp=1, force_call=0.0, fi
         prompts = []
         for msgs, t in zip(batch, tools):
             clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs]
+            if hide_reasoning:  # CoT model: drop earlier steps' reasoning so greedy decoding cannot copy it forward
+                clean = [{**m, "content": ""} if m["role"] == "assistant" and m.get("tool_calls") else m for m in clean]
             p = tok.apply_chat_template(clean, tools=t, add_generation_prompt=True, tokenize=False)
             ids = tok(p).input_ids
             if len(ids) > max_model_len - max_tokens - 32:
@@ -114,6 +117,8 @@ def main():
     ap.add_argument("--force-call", type=float, default=0.0, help="see vllm_backend; 0 = off")
     ap.add_argument("--max-tokens", type=int, default=768, help="per assistant reply (raise for a thinking model)")
     ap.add_argument("--temp", type=float, default=0.0)
+    ap.add_argument("--hide-reasoning", action="store_true",
+                    help="blank the text before earlier tool calls in the prompt (traces keep it)")
     ap.add_argument("--compact", action="store_true", help="tools as one-line signatures in the system prompt (model trained so)")
     ap.add_argument("--out", default="out")
     a = ap.parse_args()
@@ -150,7 +155,7 @@ def main():
         return
     gen = oracle_backend(items) if a.backend == "oracle" else vllm_backend(
         a.model, a.max_model_len, a.gpu_util, a.dtype, a.tp, a.force_call, str(out / "first_token.jsonl"),
-        a.max_tokens, a.temp)
+        a.max_tokens, a.temp, a.hide_reasoning)
     t0 = time.time()
     n_done = [0]
 
