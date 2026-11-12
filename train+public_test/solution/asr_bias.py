@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-bias", action="store_true")
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--dtype", default="float32", help="float16 on CUDA; MPS gives NaNs in float16")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -73,7 +74,8 @@ def main():
         items = random.Random(a.seed).sample(items, a.limit)
     hist = {d["id"]: d for d in map(json.loads, open(a.hist, encoding="utf-8"))} if a.hist else {}
     proc = WhisperProcessor.from_pretrained(a.model)
-    model = WhisperForConditionalGeneration.from_pretrained(a.model, dtype=torch.float16)
+    dt = getattr(torch, a.dtype)
+    model = WhisperForConditionalGeneration.from_pretrained(a.model, dtype=dt)
     if a.lora:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, a.lora).merge_and_unload()
@@ -88,7 +90,7 @@ def main():
             if b:
                 kw["prompt_ids"] = torch.tensor(proc.get_prompt_ids(b)[-200:]).to(a.device)
             with torch.no_grad():
-                ids = model.generate(feats.to(a.device, torch.float16), **kw)
+                ids = model.generate(feats.to(a.device, dt), **kw)
             hyp = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
             if b and hyp.startswith(b.strip()[:20]):  # some versions return the prompt too
                 hyp = hyp[len(b.strip()):].strip()
